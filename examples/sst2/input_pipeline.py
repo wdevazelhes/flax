@@ -75,12 +75,7 @@ class SST2DataSource:
     assert seed is not None, 'Please provide a seed for shuffling.'
     self.seed = seed
     self.bucket_size = bucket_size
-
-    if input_fields is None:
-      logging.info('Input fields not specified, using \'%s\'', INPUT_KEY)
-      self.input_fields = {INPUT_KEY}
-    else:
-      self.input_fields = input_fields
+    self.input_fields = {INPUT_KEY}
 
     self.train_raw = loader(train_path).cache()
     self.valid_raw = loader(valid_path).cache()
@@ -134,92 +129,92 @@ class SST2DataSource:
     self.test_dataset = self.test_raw.map(
         self.prepare_example, num_parallel_calls=AUTOTUNE).cache()
 
-    example_length_fn = lambda example: tf.size(example[INPUT_KEY])
     self.max_sentence_length = max(
-        base.get_max_sentence_length(self.train_dataset, example_length_fn),
-        base.get_max_sentence_length(self.valid_dataset, example_length_fn),
-        base.get_max_sentence_length(self.test_dataset, example_length_fn))
+        base.get_max_sentence_length(self.train_dataset, self.example_length_fn),
+        base.get_max_sentence_length(self.valid_dataset, self.example_length_fn),
+        base.get_max_sentence_length(self.test_dataset, self.example_length_fn))
     logging.info('Maximum sentence length across datasets: %d',
                  self.max_sentence_length)
     logging.info('Datasets loaded.')
     logging.info('First example: %r', next(iter(tfds.as_numpy(self.train_raw))))
 
+  @property
+  def input_features(self):
+    """The example features used as input to a model."""
+    return {INPUT_KEY}
+
+  @property
+  def padded_shapes(self):
+    """The padded shapes used by batching functions."""
+    return {INPUT_KEY: [None], LABEL_KEY: [], LENGTH_KEY: []}
+
+  def example_length_fn(self, example: ExampleType) -> tf.Tensor:
+    """Returns the length of the example for the purpose of the bucketing."""
+    return tf.size(example[INPUT_KEY])
+
   def get_tokens(self,
-                 datasets: List[tf.data.Dataset]) -> Iterable[List[bytes]]:
+                 datasets: Iterable[tf.data.Dataset]) -> Iterable[List[bytes]]:
     """Returns a list of tokens for all input fields in the given datasets."""
 
-    def _tokenize_fields(example: ExampleType) -> ExampleType:
-      for key in example:
-        if key != LABEL_KEY:
-          example[key] = self.tokenizer.tokenize(example[key])
+    def _tokenize_input_features(example: types.Example) -> types.Example:
+      """Tokenizes all input features in an example."""
+      for feature in example:
+        if feature in self.input_features:
+          example[feature] = self.tokenizer.tokenize(example[feature])
       return example
 
     for dataset in datasets:
+      # Apply the tokenizer to all input features.
       tokenized_dataset = dataset.map(
-          _tokenize_fields, num_parallel_calls=AUTOTUNE)
+          _tokenize_input_features, num_parallel_calls=constants.AUTOTUNE)
+      # Yield all tokenized input features (i.e., tokenized input sentences).
       for example in tfds.as_numpy(tokenized_dataset):
-        for key in self.input_fields:
-          yield example[key]
-
-  def prepare_example(self, example: ExampleType) -> ExampleType:
-    """Prepares an example by converting to IDs and wrapping in <s> and </s>."""
-    example_input = self.tf_vocab.lookup(
-        self.tokenizer.tokenize(example[INPUT_KEY]))
-    if QUERY_KEY in example:
-      example_query = self.tf_vocab.lookup(
-          self.tokenizer.tokenize(example[QUERY_KEY]))
-      if self.concatenate_input_fields:
-        example_input = self.concat(example_input, example_query)
-        del example[QUERY_KEY]
-      else:
-        example[QUERY_KEY] = self.add_bos_eos(example_query)
-        example[QUERY_LENGTH_KEY] = tf.size(example[QUERY_KEY])
-    example[INPUT_KEY] = self.add_bos_eos(example_input)
-    example[LENGTH_KEY] = tf.size(example[INPUT_KEY])
-    return example
+        for feature in self.input_features:
+          yield example[feature]
 
   def add_bos_eos(self, sequence: tf.Tensor) -> tf.Tensor:
     """Prepends BOS ID and appends EOS ID to a sequence of token IDs."""
     return tf.concat([[self.bos_idx], sequence, [self.eos_idx]], 0)
 
-  def concat(self, sequence_a: tf.Tensor, sequence_b: tf.Tensor) -> tf.Tensor:
-    """Concatenates two sequences with a delimiter."""
-    return tf.concat([sequence_a, [self.sep_idx], sequence_b], 0)
+  def prepare_example(self, example: ExampleType) -> ExampleType:
+    """Prepares an example by converting to IDs and wrapping in <s> and </s>."""
+    example_input = self.tf_vocab.lookup(
+        self.tokenizer.tokenize(example[INPUT_KEY]))
+    example[INPUT_KEY] = self.add_bos_eos(example_input)
+    example[LENGTH_KEY] = tf.size(example[INPUT_KEY])
+    return example
 
-  def get_batches(self, dataset: tf.data.Dataset, batch_size: int):
-    """Returns an iterator with batches for the provided dataset."""
-    padded_shapes = {
-        IDX_KEY: [], INPUT_KEY: [None], LABEL_KEY: [], LENGTH_KEY: []}
-    example_size_fn = lambda x: tf.size(x[INPUT_KEY])
-    return _get_batches(
-        dataset, batch_size, self.bucket_size, self.max_sentence_length, 
-        padded_shapes, example_size_fn)
+  def get_batches(self,
+                  dataset: tf.data.Dataset,
+                  batch_size: int,
+                  drop_remainder: bool = False,
+                  shuffle: bool = False):
+    """Returns an iterator with padded batches for the provided dataset."""
+    if shuffle:
+      buffer_size = utils.cardinality(dataset)  # The number of examples.
+      dataset = dataset.shuffle(
+          buffer_size, seed=self.seed, reshuffle_each_iteration=True)
+    return dataset.padded_batch(
+        batch_size,
+        padded_shapes=self.padded_shapes,
+        drop_remainder=drop_remainder)
 
-  def get_bucketed_batches(self, dataset: tf.data.Dataset, batch_size: int):
-    """Returns an iterator with batches for the provided dataset."""
-    padded_shapes = {
-        IDX_KEY: [], INPUT_KEY: [None], LABEL_KEY: [], LENGTH_KEY: []}
-    example_size_fn = lambda x: tf.size(x[INPUT_KEY])
-    return _get_bucketed_batches(
-        dataset, batch_size, self.bucket_size, self.max_sentence_length, 
-        padded_shapes, example_size_fn)
-
-  def get_shuffled_bucketed_batches(self,
+  def get_bucketed_batches(self,
                            dataset: tf.data.Dataset,
                            batch_size: int,
-                           drop_remainder: bool = True):
-    """Returns an iterator with batches for the provided dataset."""
-    padded_shapes = {INPUT_KEY: [None], LABEL_KEY: [], LENGTH_KEY: []}
-    example_size_fn = lambda x: tf.size(x[INPUT_KEY])
-    return _get_bucketed_batches(
+                           bucket_size: int,
+                           drop_remainder: bool = False,
+                           shuffle: bool = False):
+    """Returns an iterator with bucketed batches for the provided dataset."""
+    return get_bucketed_batches(
         dataset,
         batch_size,
-        self.bucket_size,
+        bucket_size,
         self.max_sentence_length,
-        padded_shapes,
-        example_size_fn,
+        self.padded_shapes,
+        self.example_length_fn,
         seed=self.seed,
-        shuffle=True,
+        shuffle=shuffle,
         drop_remainder=drop_remainder)
 
 
@@ -235,16 +230,29 @@ def get_max_sentence_length(dataset: tf.data.Dataset,
   return max_length
 
 
-def _get_batches(dataset: tf.data.Dataset, batch_size: int, 
-                 padded_shapes: Any) -> tf.data.Dataset:
-  """Returns a Dataset that consists of padded batches when iterated over."""
-  return dataset.padded_batch(
-      batch_size,
-      padded_shapes=padded_shapes,
-      drop_remainder=False).prefetch(tf.data.experimental.AUTOTUNE)
+def get_bucket_boundaries(bucket_size: int, max_size: int) -> np.ndarray:
+  """Bucket boundaries with `bucket_size` items per bucket, up to `max_size`.
+
+  Example:
+  ```
+  get_bucket_boundaries(8, 24)
+  [9, 17, 25]
+  ```
+  E.g., the first boundary covers items with sizes 0-8, the next boundary covers
+  items with sizes 9-16, and the last bucket covers sizes 17-24. Each bucket
+  covers 8 different sizes (e.g., sentence lengths).
+
+  Args:
+   bucket_size: The number of different items per bucket.
+   max_size: The maximum size to be expected for a bucket.
+
+  Returns:
+    A list of (exclusive) bucket boundaries.
+  """
+  return np.arange(bucket_size, max_size + bucket_size, bucket_size) + 1
 
 
-def _get_bucketed_batches(
+def get_bucketed_batches(
     dataset: tf.data.Dataset,
     batch_size: int,
     bucket_size: int,
@@ -312,8 +320,8 @@ def _get_bucketed_batches(
         num_examples, seed=seed,
         reshuffle_each_iteration=True).apply(bucket_fn).shuffle(
             num_batches, seed=seed,
-            reshuffle_each_iteration=True).prefetch(AUTOTUNE)
-  return dataset.apply(bucket_fn).prefetch(AUTOTUNE)
+            reshuffle_each_iteration=True).prefetch(constants.AUTOTUNE)
+  return dataset.apply(bucket_fn).prefetch(constants.AUTOTUNE)
 
 
 def build_vocabulary(sequences: Iterable[Sequence[bytes]],
@@ -352,4 +360,3 @@ def build_vocabulary(sequences: Iterable[Sequence[bytes]],
   logging.info('Number of unfiltered tokens: %d', len(counter))
   logging.info('Vocabulary size: %d', len(vocab))
   return vocab
-  
