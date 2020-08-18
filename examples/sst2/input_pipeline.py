@@ -35,6 +35,10 @@ INPUT_KEY = 'sentence'
 LABEL_KEY = 'label'
 LENGTH_KEY = 'length'
 
+PAD_TOKEN = b'<pad>'
+UNK_TOKEN = b'<unk>'
+BOS_TOKEN = b'<s>'
+EOS_TOKEN = b'</s>'
 
 class SST2DataSource:
   """Provides data as pre-processed batches, a vocab, and embeddings."""
@@ -49,8 +53,7 @@ class SST2DataSource:
                embedding_size: Optional[int] = None,
                embedding_cache_path: Optional[str] = None,
                embedding_type: str = 'glove',
-               bucket_size: int = DEFAULT_BUCKET_SIZE,
-               concatenate_input_fields: bool = False):
+               bucket_size: int = DEFAULT_BUCKET_SIZE):
     """Initializes the data source.
 
     Args:
@@ -76,32 +79,29 @@ class SST2DataSource:
     self.seed = seed
     self.bucket_size = bucket_size
     self.input_fields = {INPUT_KEY}
+    self.tokenizer = tokenizer
 
     self.train_raw = loader(train_path).cache()
     self.valid_raw = loader(valid_path).cache()
     self.test_raw = loader(test_path).cache()
 
-    self.tokenizer = tokenizer
-    self.concatenate_input_fields = concatenate_input_fields
 
     if vocab_path and gfile.Exists(vocab_path):
       self.vocab = utils.load_vocabulary(gfile.Open(vocab_path, 'rb'))
     else:
       special_tokens = [
-          base.PAD_TOKEN, base.UNK_TOKEN, base.BOS_TOKEN, base.EOS_TOKEN
+          PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN
       ]
-      if concatenate_input_fields:
-        special_tokens.append(base.SEP_TOKEN)
-      self.vocab = utils.build_vocabulary(
+      self.vocab = build_vocabulary(
           self.get_tokens([self.train_raw]),
           min_freq=min_freq,
           special_tokens=special_tokens)
 
-    self.pad_idx = self.vocab.get(base.PAD_TOKEN, None)
-    self.unk_idx = self.vocab.get(base.UNK_TOKEN, None)
-    self.bos_idx = self.vocab.get(base.BOS_TOKEN, None)
-    self.eos_idx = self.vocab.get(base.EOS_TOKEN, None)
-    self.sep_idx = self.vocab.get(base.SEP_TOKEN, None)
+    self.pad_idx = self.vocab.get(PAD_TOKEN, None)
+    self.unk_idx = self.vocab.get(UNK_TOKEN, None)
+    self.bos_idx = self.vocab.get(BOS_TOKEN, None)
+    self.eos_idx = self.vocab.get(EOS_TOKEN, None)
+    self.sep_idx = self.vocab.get(SEP_TOKEN, None)
     self.tf_vocab = utils.build_tf_hashtable(self.vocab, self.unk_idx)
 
     if embedding_cache_path and gfile.Exists(embedding_cache_path):
